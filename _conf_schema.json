@@ -1,0 +1,65 @@
+{
+  "max_search_results": {
+    "description": "搜索和列表最多展示数量",
+    "type": "int",
+    "default": 5
+  },
+  "allow_download": {
+    "description": "是否允许通过聊天命令启动下载",
+    "type": "bool",
+    "default": false,
+    "obvious_hint": true,
+    "hint": "只应在确认自己有权下载/缓存相关内容时开启。"
+  },
+  "download_poll_seconds": {
+    "description": "下载命令启动后自动轮询进度的秒数",
+    "type": "int",
+    "default": 10,
+    "hint": "插件会在启动下载后短时间轮询一次进度；后续可用 /jm 进 查询。"
+  },
+  "download_dir_name": {
+    "description": "漫画下载文件夹名称或绝对路径",
+    "type": "string",
+    "default": "ComicDownloads",
+    "hint": "相对路径会放在 data/plugin_data/astrbot_plugin_jmcomic_reader/ 下；绝对路径会直接使用该目录。旧的 DownloadedComics 内容会自动迁移。"
+  },
+  "user_whitelist": {
+    "description": "个人白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string",
+      "description": "用户 QQ 号"
+    },
+    "hint": "留空表示不按个人限制。命中个人白名单时优先允许使用，即使所在群不在群聊白名单。"
+  },
+  "group_whitelist": {
+    "description": "群聊白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string",
+      "description": "群号"
+    },
+    "hint": "留空表示不按群聊限制。若配置了白名单但当前用户和群聊都未命中，则拒绝使用。"
+  },
+  "auto_delete_enabled": {
+    "description": "是否启用定时删除已下载漫画文件",
+    "type": "bool",
+    "default": false,
+    "obvious_hint": true,
+    "hint": "开启后会按保留时长删除下载文件夹中的本地漫画文件和数据库记录。"
+  },
+  "auto_delete_after_hours": {
+    "description": "漫画下载文件保留小时数",
+    "type": "int",
+    "default": 24,
+    "hint": "目录最后修改时间早于该小时数时会被自动删除，最小为 1。"
+  },
+  "auto_delete_interval_minutes": {
+    "description": "自动删除检查间隔分钟数",
+    "type": "int",
+    "default": 30,
+    "hint": "后台清理线程的检查频率，最小为 1。"
+  }
+}

@@ -1,0 +1,757 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+PLUGIN_DIR = Path(__file__).resolve().parent
+if str(PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_DIR))
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api import message_components as Comp
+from astrbot.api.star import Context, Star
+from astrbot.core.message.message_event_result import MessageChain
+
+try:
+    from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+except Exception:  # pragma: no cover - compatibility fallback
+    get_astrbot_data_path = None
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "开启", "是"}
+    return bool(value)
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[\s,，]+", value.strip())
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = [value]
+    return [str(item).strip() for item in raw_items if str(item).strip()]
+
+
+def _looks_like_jm_id(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{3,}", (value or "").strip()))
+
+
+class JMComicReaderPlugin(Star):
+    """Self-contained AstrBot plugin for JMComicReaderProject core features."""
+
+    def __init__(self, context: Context, config: dict[str, Any] | None = None):
+        super().__init__(context)
+        self._raw_config = config or {}
+        self._config = self._load_config()
+        self._download_progress: dict[str, dict[str, Any]] = {}
+        self._download_alias: dict[str, str] = {}
+        self._lock = threading.RLock()
+        self._services_ready = False
+        self._service_error = ""
+        self._stop_cleanup = threading.Event()
+        self._cleanup_thread: threading.Thread | None = None
+        self._init_storage()
+        self._init_services()
+        self._start_cleanup_worker()
+
+    def _load_config(self) -> dict[str, Any]:
+        raw_conf: dict[str, Any] = self._raw_config if isinstance(self._raw_config, dict) else {}
+        if not raw_conf:
+            for attr in ("config", "conf"):
+                value = getattr(self, attr, None)
+                if isinstance(value, dict):
+                    raw_conf = value
+                    break
+
+        return {
+            "max_search_results": max(1, _as_int(raw_conf.get("max_search_results"), 5)),
+            "allow_download": _as_bool(raw_conf.get("allow_download"), False),
+            "download_poll_seconds": max(0, _as_int(raw_conf.get("download_poll_seconds"), 10)),
+            "download_dir_name": str(raw_conf.get("download_dir_name") or "ComicDownloads").strip() or "ComicDownloads",
+            "user_whitelist": _as_str_list(raw_conf.get("user_whitelist")),
+            "group_whitelist": _as_str_list(raw_conf.get("group_whitelist")),
+            "auto_delete_enabled": _as_bool(raw_conf.get("auto_delete_enabled"), False),
+            "auto_delete_after_hours": max(1, _as_int(raw_conf.get("auto_delete_after_hours"), 24)),
+            "auto_delete_interval_minutes": max(1, _as_int(raw_conf.get("auto_delete_interval_minutes"), 30)),
+        }
+
+    def _init_storage(self) -> None:
+        if get_astrbot_data_path:
+            base = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_jmcomic_reader"
+        else:
+            base = Path(__file__).resolve().parent / "data"
+
+        self.data_dir = base
+        self.download_dir = base / self._safe_download_dir_name(self._config["download_dir_name"])
+        self.temp_dir = base / "TempCache"
+        self.backend_dir = base / "backend"
+
+        for path in (self.data_dir, self.download_dir, self.temp_dir, self.backend_dir):
+            path.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_downloads()
+
+        os.environ["BASE_DIR"] = str(self.data_dir)
+        os.environ["DOWNLOAD_DIR"] = str(self.download_dir)
+        os.environ["TEMP_CACHE_DIR"] = str(self.temp_dir)
+
+    def _safe_download_dir_name(self, value: str) -> str:
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            return str(path)
+        safe_name = re.sub(r"[\\/:*?\"<>|]+", "_", value).strip(". ")
+        return safe_name or "ComicDownloads"
+
+    def _migrate_legacy_downloads(self) -> None:
+        legacy_dir = self.data_dir / "DownloadedComics"
+        if legacy_dir == self.download_dir or not legacy_dir.is_dir():
+            return
+        try:
+            for child in legacy_dir.iterdir():
+                target = self.download_dir / child.name
+                if target.exists():
+                    continue
+                shutil.move(str(child), str(target))
+                logger.info(f"JM migrated legacy download: {child} -> {target}")
+        except Exception:
+            logger.exception("JM legacy download migration failed")
+
+    def _init_services(self) -> None:
+        try:
+            from models.database import init_database
+            from services.comic_manager import ComicManager
+            from services.download_manager import DownloadManager
+            from services.jm_crawler import JMCrawler
+
+            init_database()
+            self.jm_crawler = JMCrawler()
+            self.comic_manager = ComicManager()
+            self.download_manager = DownloadManager()
+            self._services_ready = True
+        except Exception as e:
+            logger.exception("JMComicReader internal services init failed")
+            self._service_error = str(e)
+            self._services_ready = False
+
+    def _start_cleanup_worker(self) -> None:
+        if not self._config["auto_delete_enabled"]:
+            return
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_worker,
+            name="jmcomic-auto-delete",
+            daemon=True,
+        )
+        self._cleanup_thread.start()
+
+    def _cleanup_worker(self) -> None:
+        # Run once shortly after startup, then at the configured interval.
+        interval_seconds = self._config["auto_delete_interval_minutes"] * 60
+        while not self._stop_cleanup.wait(60):
+            try:
+                self._cleanup_expired_downloads()
+            except Exception:
+                logger.exception("JM auto delete failed")
+            if self._stop_cleanup.wait(interval_seconds):
+                break
+
+    def _cleanup_expired_downloads(self) -> int:
+        if not self._services_ready:
+            return 0
+
+        cutoff = datetime.now() - timedelta(hours=self._config["auto_delete_after_hours"])
+        deleted = 0
+        for comic_dir in sorted(self.download_dir.iterdir()):
+            if not comic_dir.is_dir():
+                continue
+            if comic_dir.stat().st_mtime > cutoff.timestamp():
+                continue
+
+            match = re.match(r"^(\d+)_", comic_dir.name)
+            if not match:
+                continue
+            jm_id = int(match.group(1))
+            try:
+                if self.comic_manager.delete_comic(jm_id):
+                    deleted += 1
+                    with self._lock:
+                        self._download_alias.pop(str(jm_id), None)
+                    logger.info(f"JM auto deleted expired comic JM-{jm_id}: {comic_dir}")
+            except Exception:
+                logger.exception(f"JM auto delete failed for JM-{jm_id}")
+        return deleted
+
+    def _ensure_ready(self) -> str | None:
+        if self._services_ready:
+            return None
+        return (
+            "JM 内置服务初始化失败。\n"
+            f"错误: {self._service_error or 'unknown'}\n"
+            "请检查插件依赖是否安装成功，尤其是 jmcomic、Pillow、img2pdf、PyYAML。"
+        )
+
+    def _whitelist_error(self, event: AstrMessageEvent) -> str | None:
+        user_whitelist = set(self._config["user_whitelist"])
+        group_whitelist = set(self._config["group_whitelist"])
+        if not user_whitelist and not group_whitelist:
+            return None
+
+        sender_id = str(event.get_sender_id() or "").strip()
+        group_id = str(event.get_group_id() or "").strip()
+        if sender_id and sender_id in user_whitelist:
+            return None
+        if group_id and group_id in group_whitelist:
+            return None
+
+        if group_id:
+            return "你所在的群聊或当前用户不在 JM 插件白名单中。"
+        return "当前用户不在 JM 插件个人白名单中。"
+
+    def _help_text(self) -> str:
+        return "\n".join(
+            [
+                "JM 常用命令:",
+                "/jm 搜 <关键词> [页码] - 搜索",
+                "/jm <JM号> - 查看详情",
+                "/jm 下 <JM号> - 下载",
+                "/jm 进 <JM号或download_id> - 查进度",
+                "/jm 看 <JM号> - 本地阅读信息",
+                "/jm 列 - 已下载列表",
+                "/jm 状态 - 插件状态",
+                "/jm 帮助 - 显示帮助",
+            ]
+        )
+
+    def _format_comic_line(self, comic: dict[str, Any], index: int | None = None) -> str:
+        jm_id = comic.get("id") or comic.get("jm_id") or comic.get("album_id") or "-"
+        title = comic.get("title") or comic.get("name") or "未命名"
+        author = comic.get("author") or comic.get("artist") or ""
+        pages = comic.get("pages") or comic.get("page_count") or ""
+        prefix = f"{index}. " if index is not None else ""
+        suffix = []
+        if author:
+            suffix.append(f"作者: {author}")
+        if pages:
+            suffix.append(f"页数: {pages}")
+        detail = f" ({' / '.join(suffix)})" if suffix else ""
+        return f"{prefix}JM-{jm_id} | {title}{detail}"
+
+    async def _status_text(self) -> str:
+        lines = [
+            "JM 插件状态:",
+            f"服务初始化: {'正常' if self._services_ready else '失败'}",
+            f"数据目录: {self.data_dir}",
+            f"下载目录: {self.download_dir}",
+            f"允许下载: {self._config['allow_download']}",
+            f"个人白名单: {len(self._config['user_whitelist'])} 个",
+            f"群聊白名单: {len(self._config['group_whitelist'])} 个",
+            f"自动删除: {self._config['auto_delete_enabled']}",
+        ]
+        if self._config["auto_delete_enabled"]:
+            lines.append(f"保留时长: {self._config['auto_delete_after_hours']} 小时")
+        if self._service_error:
+            lines.append(f"初始化错误: {self._service_error}")
+        return "\n".join(lines)
+
+    async def _search_text(self, keyword: str, page: int = 1) -> str:
+        if err := self._ensure_ready():
+            return err
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return "用法: /jm 搜 <关键词> [页码]"
+
+        page = max(1, int(page))
+        try:
+            results = await asyncio.to_thread(self.jm_crawler.search_by_keyword, keyword, "desc", page)
+        except Exception as e:
+            logger.exception("JM search failed")
+            return f"搜索失败: {e}"
+
+        if not results:
+            return "没有搜索结果"
+
+        limit = self._config["max_search_results"]
+        lines = [f"搜索结果: {keyword} (第 {page} 页，显示前 {min(limit, len(results))} 条)"]
+        for index, comic in enumerate(results[:limit], start=1):
+            if isinstance(comic, dict):
+                lines.append(self._format_comic_line(comic, index))
+        lines.append("详情: /jm <JM号>")
+        lines.append("下载: /jm 下 <JM号>")
+        return "\n".join(lines)
+
+    async def _info_payload(self, jm_id: int) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self.jm_crawler.get_comic_info, jm_id)
+
+    async def _info_text(self, jm_id: int) -> str:
+        if err := self._ensure_ready():
+            return err
+        if jm_id <= 0:
+            return "用法: /jm <JM号>"
+
+        try:
+            comic = await self._info_payload(jm_id)
+        except Exception as e:
+            logger.exception("JM info failed")
+            return f"获取详情失败: {e}"
+
+        if not comic:
+            return "获取详情失败: 未找到对应漫画"
+
+        tags = comic.get("tags") or []
+        tags_text = ", ".join(str(tag) for tag in tags[:12]) if isinstance(tags, list) else str(tags)
+        lines = [
+            self._format_comic_line(comic),
+            f"收藏: {comic.get('favorites', '-')}",
+            f"标签: {tags_text or '-'}",
+        ]
+        if comic.get("description"):
+            lines.append(f"简介: {comic.get('description')}")
+        lines.append(f"阅读: /jm 看 {jm_id}")
+        lines.append(f"下载: /jm 下 {jm_id}")
+        return "\n".join(lines)
+
+    def _update_progress(self, download_id: str, progress: int, status: str, message: str) -> None:
+        with self._lock:
+            self._download_progress[download_id] = {
+                "progress": progress,
+                "status": status,
+                "message": message,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+    def _download_worker(
+        self,
+        jm_id: int,
+        comic_info: dict[str, Any],
+        download_id: str,
+        session: str | None = None,
+        loop: asyncio.AbstractEventLoop | None = None,
+        title_line: str = "",
+    ) -> None:
+        try:
+            self.download_manager.download_comic(
+                jm_id,
+                comic_info,
+                lambda p, s, m: self._update_progress(download_id, p, s, m),
+            )
+            with self._lock:
+                current = self._download_progress.get(download_id, {})
+                if current.get("status") != "error":
+                    self._update_progress(download_id, 100, "completed", "下载完成")
+            if session and loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self._send_download_to_session(session, jm_id, title_line),
+                    loop,
+                )
+        except Exception as e:
+            logger.exception("JM download worker failed")
+            self._update_progress(download_id, 0, "error", str(e))
+
+    def _find_sendable_comic_file(self, jm_id: int) -> Path | None:
+        comic_path = self.comic_manager.get_comic_path(jm_id)
+        if not comic_path:
+            return None
+
+        path = Path(comic_path)
+        if path.is_file():
+            return path
+        if path.is_dir():
+            pdf_files = sorted(path.glob("*.pdf"))
+            if pdf_files:
+                return pdf_files[0]
+        return None
+
+    async def _send_download_to_session(self, session: str, jm_id: int, title_line: str = "") -> None:
+        try:
+            send_file = await asyncio.to_thread(self._find_sendable_comic_file, jm_id)
+            if not send_file or not send_file.exists():
+                await self.context.send_message(
+                    session,
+                    MessageChain(
+                        [
+                            Comp.Plain(
+                                f"JM-{jm_id} 下载完成，但没有找到可上传的 PDF 文件。\n阅读: /jm 看 {jm_id}"
+                            )
+                        ]
+                    ),
+                )
+                return
+
+            header = title_line or f"JM-{jm_id}"
+            await self.context.send_message(
+                session,
+                MessageChain([Comp.Plain(f"{header}\n下载完成，正在上传文件...")]),
+            )
+            await self.context.send_message(
+                session,
+                MessageChain([Comp.File(name=send_file.name, file=str(send_file.resolve()))]),
+            )
+            logger.info(f"JM-{jm_id} uploaded to session {session}: {send_file}")
+        except Exception:
+            logger.exception(f"JM-{jm_id} upload to session failed: {session}")
+
+    async def _download_text(self, jm_id: int, event: AstrMessageEvent | None = None) -> str:
+        if err := self._ensure_ready():
+            return err
+        if jm_id <= 0:
+            return "用法: /jm 下 <JM号>"
+        if not self._config["allow_download"]:
+            return "下载命令已禁用。请在插件配置中设置 allow_download=true 后再使用。"
+
+        try:
+            already = await asyncio.to_thread(self.comic_manager.is_comic_downloaded, jm_id)
+            comic = await self._info_payload(jm_id)
+        except Exception as e:
+            logger.exception("JM pre-download check failed")
+            return f"启动下载失败: {e}"
+
+        title_line = self._format_comic_line(comic) if comic else f"JM-{jm_id}"
+        if already:
+            if event:
+                await self._send_download_to_session(event.unified_msg_origin, jm_id, title_line)
+            return f"{title_line}\n已经下载，已尝试上传到当前对话。\n阅读: /jm 看 {jm_id}"
+        if not comic:
+            return "启动下载失败: 未找到对应漫画"
+
+        download_id = f"{jm_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        loop = asyncio.get_running_loop()
+        session = event.unified_msg_origin if event else None
+        with self._lock:
+            self._download_alias[str(jm_id)] = download_id
+            self._download_progress[download_id] = {
+                "progress": 0,
+                "status": "starting",
+                "message": "下载任务已创建",
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        thread = threading.Thread(
+            target=self._download_worker,
+            args=(jm_id, comic, download_id, session, loop, title_line),
+            daemon=True,
+        )
+        thread.start()
+
+        lines = [
+            title_line,
+            "下载任务已启动",
+            f"download_id: {download_id}",
+            f"查进度: /jm 进 {download_id}",
+        ]
+        poll_seconds = self._config["download_poll_seconds"]
+        if poll_seconds > 0:
+            await asyncio.sleep(min(poll_seconds, 30))
+            progress = self._progress_data(download_id)
+            if progress:
+                lines.append(
+                    f"当前进度: {progress.get('progress', 0)}% | "
+                    f"{progress.get('status', '-')} | {progress.get('message', '-')}"
+                )
+        return "\n".join(lines)
+
+    def _progress_data(self, download_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            data = self._download_progress.get(download_id)
+            return dict(data) if data else None
+
+    async def _downloaded_status_text(self, jm_id_text: str, download_id: str | None = None) -> str | None:
+        if not _looks_like_jm_id(jm_id_text) or not self._services_ready:
+            return None
+        try:
+            downloaded = await asyncio.to_thread(self.comic_manager.is_comic_downloaded, int(jm_id_text))
+        except Exception:
+            downloaded = False
+        if not downloaded:
+            return None
+
+        if download_id:
+            with self._lock:
+                self._download_progress[download_id] = {
+                    "progress": 100,
+                    "status": "completed",
+                    "message": "下载完成",
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                self._download_alias[jm_id_text] = download_id
+            return "\n".join(
+                [
+                    f"download_id: {download_id}",
+                    "进度: 100%",
+                    "状态: completed",
+                    "消息: 下载完成",
+                    f"阅读: /jm 看 {jm_id_text}",
+                ]
+            )
+        return f"JM-{jm_id_text} 已下载完成。\n阅读: /jm 看 {jm_id_text}"
+
+    async def _progress_text(self, identifier: str) -> str:
+        identifier = (identifier or "").strip()
+        if not identifier:
+            return "用法: /jm 进 <JM号或download_id>"
+
+        with self._lock:
+            download_id = self._download_alias.get(identifier, identifier)
+        progress = self._progress_data(download_id)
+        if not progress:
+            jm_id_from_download_id = download_id.split("_", 1)[0]
+            downloaded_text = await self._downloaded_status_text(jm_id_from_download_id, download_id)
+            if downloaded_text:
+                return downloaded_text
+            if _looks_like_jm_id(identifier):
+                downloaded_text = await self._downloaded_status_text(identifier)
+                if downloaded_text:
+                    return downloaded_text
+                return "没有找到这个 JM 号对应的下载任务。请使用 /jm 下 <JM号> 后返回的 download_id 查询。"
+            return f"查询进度失败: 下载任务不存在或已过期 ({download_id})"
+
+        if progress.get("status") != "completed":
+            jm_id_from_download_id = download_id.split("_", 1)[0]
+            downloaded_text = await self._downloaded_status_text(jm_id_from_download_id, download_id)
+            if downloaded_text:
+                return downloaded_text
+
+        return "\n".join(
+            [
+                f"download_id: {download_id}",
+                f"进度: {progress.get('progress', 0)}%",
+                f"状态: {progress.get('status', '-')}",
+                f"消息: {progress.get('message', '-')}",
+                f"更新时间: {progress.get('updated_at', '-')}",
+            ]
+        )
+
+    async def _list_text(self) -> str:
+        if err := self._ensure_ready():
+            return err
+        try:
+            comics = await asyncio.to_thread(self.comic_manager.get_downloaded_comics)
+        except Exception as e:
+            logger.exception("JM list failed")
+            return f"获取已下载列表失败: {e}"
+
+        if not comics:
+            return "当前没有已下载漫画"
+
+        limit = self._config["max_search_results"]
+        lines = [f"已下载漫画 (显示前 {min(limit, len(comics))} 条):"]
+        for index, comic in enumerate(comics[:limit], start=1):
+            if isinstance(comic, dict):
+                lines.append(self._format_comic_line(comic, index))
+        lines.append("阅读: /jm 看 <JM号>")
+        return "\n".join(lines)
+
+    async def _read_text(self, jm_id: int) -> str:
+        if err := self._ensure_ready():
+            return err
+        if jm_id <= 0:
+            return "用法: /jm 看 <JM号>"
+
+        try:
+            downloaded = await asyncio.to_thread(self.comic_manager.is_comic_downloaded, jm_id)
+            if not downloaded:
+                return "该漫画尚未下载。请先使用 /jm 下 <JM号>。"
+            chapters = await asyncio.to_thread(self.comic_manager.get_comic_chapters, jm_id)
+            comic_path = await asyncio.to_thread(self.comic_manager.get_comic_path, jm_id)
+        except Exception as e:
+            logger.exception("JM read failed")
+            return f"获取阅读信息失败: {e}"
+
+        return "\n".join(
+            [
+                f"JM-{jm_id}",
+                f"章节数: {len(chapters or [])}",
+                f"本地路径: {comic_path or '-'}",
+                "如需网页阅读，请继续使用 JMComicReaderProject Web 版；本插件不启动 Flask 服务。",
+            ]
+        )
+
+    async def _delete_text(self, jm_id: int) -> str:
+        if err := self._ensure_ready():
+            return err
+        if jm_id <= 0:
+            return "用法: /jm_delete <JM号>"
+
+        try:
+            ok = await asyncio.to_thread(self.comic_manager.delete_comic, jm_id)
+        except Exception as e:
+            logger.exception("JM delete failed")
+            return f"删除失败: {e}"
+
+        if not ok:
+            return "删除失败: 本地记录或文件不存在"
+        with self._lock:
+            self._download_alias.pop(str(jm_id), None)
+        return f"已删除本地漫画: JM-{jm_id}"
+
+    def _jm_args(self, event: AstrMessageEvent) -> str:
+        text = (event.message_str or "").strip()
+        if text.startswith("/jm"):
+            return text[3:].strip()
+        if text.startswith("jm"):
+            return text[2:].strip()
+        return text
+
+    @filter.command("jm")
+    async def jm(self, event: AstrMessageEvent):
+        """日常主命令：/jm"""
+        args = self._jm_args(event)
+        if not args or args in {"帮助", "help", "h", "?"}:
+            yield event.plain_result(self._help_text())
+            return
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+
+        parts = args.split()
+        action = parts[0]
+        rest = parts[1:]
+
+        if _looks_like_jm_id(action):
+            yield event.plain_result(await self._info_text(int(action)))
+            return
+
+        if action in {"搜", "搜索", "s", "search"}:
+            if not rest:
+                yield event.plain_result("用法: /jm 搜 <关键词> [页码]")
+                return
+            page = 1
+            if len(rest) >= 2 and rest[-1].isdigit():
+                page = int(rest[-1])
+                keyword = " ".join(rest[:-1])
+            else:
+                keyword = " ".join(rest)
+            yield event.plain_result(await self._search_text(keyword, page))
+            return
+
+        if action in {"下", "下载", "d", "download"}:
+            if not rest or not _looks_like_jm_id(rest[0]):
+                yield event.plain_result("用法: /jm 下 <JM号>")
+                return
+            yield event.plain_result(await self._download_text(int(rest[0]), event))
+            return
+
+        if action in {"进", "进度", "p", "progress"}:
+            if not rest:
+                yield event.plain_result("用法: /jm 进 <JM号或download_id>")
+                return
+            yield event.plain_result(await self._progress_text(rest[0]))
+            return
+
+        if action in {"看", "阅读", "r", "read"}:
+            if not rest or not _looks_like_jm_id(rest[0]):
+                yield event.plain_result("用法: /jm 看 <JM号>")
+                return
+            yield event.plain_result(await self._read_text(int(rest[0])))
+            return
+
+        if action in {"列", "列表", "l", "list"}:
+            yield event.plain_result(await self._list_text())
+            return
+
+        if action in {"状态", "status"}:
+            yield event.plain_result(await self._status_text())
+            return
+
+        if action in {"删", "删除", "delete", "del"}:
+            yield event.plain_result("删除请使用管理员命令: /jm_delete <JM号>")
+            return
+
+        yield event.plain_result(f"未知子命令: {action}\n\n{self._help_text()}")
+
+    @filter.command("jm_help")
+    async def jm_help(self, event: AstrMessageEvent):
+        """显示 JMComicReader 插件帮助"""
+        yield event.plain_result(self._help_text())
+
+    @filter.command("jm_status")
+    async def jm_status(self, event: AstrMessageEvent):
+        """检查插件状态"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._status_text())
+
+    @filter.command("jm_search")
+    async def jm_search(self, event: AstrMessageEvent, keyword: str = "", page: int = 1):
+        """搜索漫画：/jm_search <关键词> [页码]"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._search_text(keyword, page))
+
+    @filter.command("jm_info")
+    async def jm_info(self, event: AstrMessageEvent, jm_id: int = 0):
+        """查看漫画详情：/jm_info <JM号>"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._info_text(jm_id))
+
+    @filter.command("jm_download")
+    async def jm_download(self, event: AstrMessageEvent, jm_id: int = 0):
+        """启动下载：/jm_download <JM号>"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._download_text(jm_id, event))
+
+    @filter.command("jm_progress")
+    async def jm_progress(self, event: AstrMessageEvent, download_id: str = ""):
+        """查询下载进度：/jm_progress <download_id>"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._progress_text(download_id))
+
+    @filter.command("jm_list")
+    async def jm_list(self, event: AstrMessageEvent):
+        """列出已下载漫画"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._list_text())
+
+    @filter.command("jm_read")
+    async def jm_read(self, event: AstrMessageEvent, jm_id: int = 0):
+        """获取本地阅读信息：/jm_read <JM号>"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._read_text(jm_id))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("jm_delete")
+    async def jm_delete(self, event: AstrMessageEvent, jm_id: int = 0):
+        """删除本地漫画：/jm_delete <JM号>"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        sender = event.get_sender_name()
+        logger.info(f"jm_delete requested by {sender} for JM-{jm_id}")
+        yield event.plain_result(await self._delete_text(jm_id))
+
+    async def terminate(self):
+        self._stop_cleanup.set()
+        logger.info("JMComicReaderPlugin terminated")

@@ -1,0 +1,17 @@
+name: astrbot_plugin_jmcomic_reader
+display_name: JMComicReader 控制插件
+desc: 通过 AstrBot 命令对接本机 JMComicReaderProject 服务，提供搜索、详情、下载任务、进度和本地阅读入口管理。
+short_desc: 对接 JMComicReaderProject 的 AstrBot 插件
+version: v1.0.0
+author: local
+repo: ""
+astrbot_version: ">=4.17.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - discord
+  - slack
+  - kook
+  - satori
+  - weixin_oc
