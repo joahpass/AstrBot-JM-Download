@@ -154,6 +154,14 @@ class JMCrawler:
     def _build_client(self):
         return self._build_option().build_jm_client()
 
+    def get_domain_info(self) -> List[str]:
+        try:
+            client = self._build_client()
+            domains = list(getattr(client, "domain_list", []) or [])
+            return [str(domain) for domain in domains if str(domain).strip()]
+        except Exception:
+            return []
+
     def _parse_count(self, value) -> int:
         if value is None:
             return 0

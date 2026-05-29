@@ -83,6 +83,8 @@ class JMComicReaderPlugin(Star):
         ("month", "月排行"),
     ]
     RANK_SESSION_TTL = 180
+    RANK_CACHE_TTL = 600
+    DOWNLOAD_STALE_SECONDS = 600
 
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
@@ -91,6 +93,7 @@ class JMComicReaderPlugin(Star):
         self._download_progress: dict[str, dict[str, Any]] = {}
         self._download_alias: dict[str, str] = {}
         self._rank_sessions: dict[str, dict[str, Any]] = {}
+        self._rank_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._services_ready = False
         self._service_error = ""
@@ -264,7 +267,7 @@ class JMComicReaderPlugin(Star):
                 "/jm 进 <JM号或download_id> - 查进度",
                 "/jm 看 <JM号> - 本地阅读信息",
                 "/jm 列 - 已下载列表",
-                "/jm 榜 - 漫画排行榜，按数字选择分类和时间段",
+                "/jm 榜 [页码] - 漫画排行榜，按数字选择分类和时间段",
                 "/jm 随机 - 随机推荐漫画",
                 "/jm 状态 - 插件状态",
                 "/jm 帮助 - 显示帮助",
@@ -477,11 +480,13 @@ class JMComicReaderPlugin(Star):
 
     def _update_progress(self, download_id: str, progress: int, status: str, message: str) -> None:
         with self._lock:
+            existing = self._download_progress.get(download_id, {})
             self._download_progress[download_id] = {
                 "progress": progress,
                 "status": status,
                 "message": message,
                 "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": existing.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
     def _download_worker(
@@ -592,6 +597,7 @@ class JMComicReaderPlugin(Star):
                 "status": "starting",
                 "message": "下载任务已创建",
                 "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
         thread = threading.Thread(
@@ -627,6 +633,34 @@ class JMComicReaderPlugin(Star):
             data = self._download_progress.get(download_id)
             return dict(data) if data else None
 
+    def _jm_domain_hint(self) -> str:
+        if not self._services_ready:
+            return "-"
+        try:
+            domains = self.jm_crawler.get_domain_info()
+        except Exception:
+            logger.exception("JM domain diagnostic failed")
+            return "-"
+        return ", ".join(domains[:3]) if domains else "-"
+
+    def _parse_time(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+    def _progress_diagnostics(self, progress: dict[str, Any]) -> list[str]:
+        lines = [f"当前域名: {self._jm_domain_hint()}"]
+        updated_at = self._parse_time(progress.get("updated_at"))
+        if updated_at and progress.get("status") not in {"completed", "error"}:
+            idle_seconds = int((datetime.now() - updated_at).total_seconds())
+            if idle_seconds >= self.DOWNLOAD_STALE_SECONDS:
+                lines.append(f"诊断: 该阶段已 {idle_seconds // 60} 分钟无进度更新，可能是 JM 域名、网络或源站响应过慢。")
+                lines.append("建议: 稍后再查一次；如果持续不动，可重启任务或检查服务器网络。")
+        return lines
+
     async def _downloaded_status_text(self, jm_id_text: str, download_id: str | None = None) -> str | None:
         if not _looks_like_jm_id(jm_id_text) or not self._services_ready:
             return None
@@ -644,6 +678,7 @@ class JMComicReaderPlugin(Star):
                     "status": "completed",
                     "message": "下载完成",
                     "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 self._download_alias[jm_id_text] = download_id
             return "\n".join(
@@ -683,15 +718,16 @@ class JMComicReaderPlugin(Star):
             if downloaded_text:
                 return downloaded_text
 
-        return "\n".join(
-            [
-                f"download_id: {download_id}",
-                f"进度: {progress.get('progress', 0)}%",
-                f"状态: {progress.get('status', '-')}",
-                f"消息: {progress.get('message', '-')}",
-                f"更新时间: {progress.get('updated_at', '-')}",
-            ]
-        )
+        lines = [
+            f"download_id: {download_id}",
+            f"进度: {progress.get('progress', 0)}%",
+            f"状态: {progress.get('status', '-')}",
+            f"消息: {progress.get('message', '-')}",
+            f"创建时间: {progress.get('created_at', '-')}",
+            f"更新时间: {progress.get('updated_at', '-')}",
+        ]
+        lines.extend(self._progress_diagnostics(progress))
+        return "\n".join(lines)
 
     async def _list_text(self) -> str:
         if err := self._ensure_ready():
@@ -761,27 +797,29 @@ class JMComicReaderPlugin(Star):
         sender = str(event.get_sender_id() or "")
         return f"{session}:{sender}"
 
-    def _rank_category_menu(self) -> str:
-        lines = ["JM 漫画排行榜", "请选择排行分类，直接回复数字："]
+    def _rank_category_menu(self, page: int = 1) -> str:
+        lines = [f"JM 漫画排行榜 (第 {page} 页)", "请选择排行分类，直接回复数字："]
         for index, (_, label) in enumerate(self.RANK_CATEGORIES, start=1):
             lines.append(f"{index}. {label}")
-        lines.append("180 秒内有效。")
+        lines.append("180 秒内有效。回复“取消”可退出。")
         return "\n".join(lines)
 
-    def _rank_period_menu(self, category_label: str) -> str:
-        lines = [f"已选择分类：{category_label}", "请选择排行时间段，直接回复数字："]
+    def _rank_period_menu(self, category_label: str, page: int = 1) -> str:
+        lines = [f"已选择分类：{category_label} / 第 {page} 页", "请选择排行时间段，直接回复数字："]
         for index, (_, label) in enumerate(self.RANK_PERIODS, start=1):
             lines.append(f"{index}. {label}")
-        lines.append("发送 /jm 榜 可重新选择分类。")
+        lines.append("回复“返回”重选分类，回复“取消”退出。")
         return "\n".join(lines)
 
-    def _start_rank_flow(self, event: AstrMessageEvent) -> str:
+    def _start_rank_flow(self, event: AstrMessageEvent, page: int = 1) -> str:
+        page = max(1, int(page or 1))
         with self._lock:
             self._rank_sessions[self._rank_session_key(event)] = {
                 "step": "category",
+                "page": page,
                 "created_at": time.time(),
             }
-        return self._rank_category_menu()
+        return self._rank_category_menu(page)
 
     def _clear_expired_rank_sessions(self) -> None:
         now = time.time()
@@ -794,68 +832,122 @@ class JMComicReaderPlugin(Star):
             for key in expired:
                 self._rank_sessions.pop(key, None)
 
-    async def _ranking_text(self, period: str, category: str, category_label: str, period_label: str) -> str:
+    def _rank_cache_get(self, period: str, category: str, page: int) -> list[dict[str, Any]] | None:
+        key = (period, category, page)
+        with self._lock:
+            cached = self._rank_cache.get(key)
+        if not cached:
+            return None
+        if time.time() - float(cached.get("created_at", 0)) > self.RANK_CACHE_TTL:
+            with self._lock:
+                self._rank_cache.pop(key, None)
+            return None
+        return list(cached.get("results") or [])
+
+    def _rank_cache_set(self, period: str, category: str, page: int, results: list[dict[str, Any]]) -> None:
+        key = (period, category, page)
+        with self._lock:
+            self._rank_cache[key] = {
+                "created_at": time.time(),
+                "results": list(results),
+            }
+
+    async def _ranking_result(
+        self,
+        period: str,
+        category: str,
+        category_label: str,
+        period_label: str,
+        page: int = 1,
+    ) -> list[Any] | str:
         if err := self._ensure_ready():
             return err
+        page = max(1, int(page or 1))
         try:
-            results = await asyncio.to_thread(self.jm_crawler.get_ranking, period, category, 1)
+            results = self._rank_cache_get(period, category, page)
+            if results is None:
+                results = await asyncio.to_thread(self.jm_crawler.get_ranking, period, category, page)
+                self._rank_cache_set(period, category, page, results)
         except Exception as e:
             logger.exception("JM ranking failed")
             return f"获取排行榜失败: {e}"
 
         if not results and period == "day":
-            results = await asyncio.to_thread(self.jm_crawler.get_ranking, "week", category, 1)
+            fallback_period = "week"
+            results = self._rank_cache_get(fallback_period, category, page)
+            if results is None:
+                results = await asyncio.to_thread(self.jm_crawler.get_ranking, fallback_period, category, page)
+                self._rank_cache_set(fallback_period, category, page, results)
             period_label = f"{period_label}(暂无结果，已切换周排行)"
 
         if not results:
             return "排行榜暂无结果，请稍后再试或换一个分类。"
 
         limit = self._config["max_search_results"]
-        lines = [f"JM {period_label} / {category_label} (显示前 {min(limit, len(results))} 条)"]
+        lines = [f"JM {period_label} / {category_label} / 第 {page} 页"]
         for index, comic in enumerate(results[:limit], start=1):
             lines.append(self._format_comic_line(comic, index))
         lines.append("详情: /jm <JM号>")
         lines.append("下载: /jm 下 <JM号>")
-        return "\n".join(lines)
+        lines.append(f"下一页: /jm 榜 {page + 1}")
+        return self._result_chain("\n".join(lines), title="JM 漫画排行榜")
 
-    async def _handle_rank_choice(self, event: AstrMessageEvent, choice_text: str) -> str | None:
+    async def _handle_rank_choice(self, event: AstrMessageEvent, choice_text: str) -> list[Any] | str | None:
         self._clear_expired_rank_sessions()
         key = self._rank_session_key(event)
         with self._lock:
             session = dict(self._rank_sessions.get(key) or {})
 
-        if not session or not choice_text.isdigit():
+        if not session:
+            return None
+        normalized = (choice_text or "").strip().lower()
+        if normalized in {"取消", "退出", "cancel", "q", "quit"}:
+            with self._lock:
+                self._rank_sessions.pop(key, None)
+            return "已取消排行榜选择。"
+        if normalized in {"返回", "上一步", "back", "b"}:
+            page = int(session.get("page") or 1)
+            with self._lock:
+                self._rank_sessions[key] = {
+                    "step": "category",
+                    "page": page,
+                    "created_at": time.time(),
+                }
+            return self._rank_category_menu(page)
+        if not choice_text.isdigit():
             return None
 
         choice = int(choice_text)
+        page = int(session.get("page") or 1)
         if session.get("step") == "category":
             if choice < 1 or choice > len(self.RANK_CATEGORIES):
-                return self._rank_category_menu()
+                return self._rank_category_menu(page)
             category, label = self.RANK_CATEGORIES[choice - 1]
             with self._lock:
                 self._rank_sessions[key] = {
                     "step": "period",
                     "category": category,
                     "category_label": label,
+                    "page": page,
                     "created_at": time.time(),
                 }
-            return self._rank_period_menu(label)
+            return self._rank_period_menu(label, page)
 
         if session.get("step") == "period":
             if choice < 1 or choice > len(self.RANK_PERIODS):
-                return self._rank_period_menu(str(session.get("category_label") or "全部"))
+                return self._rank_period_menu(str(session.get("category_label") or "全部"), page)
             period, period_label = self.RANK_PERIODS[choice - 1]
             category = str(session.get("category") or "0")
             category_label = str(session.get("category_label") or "全部")
             with self._lock:
                 self._rank_sessions.pop(key, None)
-            return await self._ranking_text(period, category, category_label, period_label)
+            return await self._ranking_result(period, category, category_label, period_label, page)
 
         with self._lock:
             self._rank_sessions.pop(key, None)
         return None
 
-    async def _random_text(self, limit: int = 5) -> str:
+    async def _random_result(self, limit: int = 5) -> list[Any] | str:
         if err := self._ensure_ready():
             return err
         try:
@@ -872,7 +964,7 @@ class JMComicReaderPlugin(Star):
             lines.append(self._format_comic_line(comic, index))
         lines.append("详情: /jm <JM号>")
         lines.append("下载: /jm 下 <JM号>")
-        return "\n".join(lines)
+        return self._result_chain("\n".join(lines), title="JM 随机推荐")
 
     def _jm_args(self, event: AstrMessageEvent) -> str:
         text = (event.message_str or "").strip()
@@ -945,14 +1037,17 @@ class JMComicReaderPlugin(Star):
             return
 
         if action in {"榜", "排行", "排行榜", "rank", "ranking"}:
-            yield event.plain_result(self._start_rank_flow(event))
+            page = 1
+            if rest and rest[0].isdigit():
+                page = max(1, int(rest[0]))
+            yield event.plain_result(self._start_rank_flow(event, page))
             return
 
         if action in {"随机", "随", "推荐", "random", "recommend"}:
             limit = 5
             if rest and rest[0].isdigit():
                 limit = max(1, min(20, int(rest[0])))
-            yield event.plain_result(await self._random_text(limit))
+            yield self._event_result(event, await self._random_result(limit))
             return
 
         if action in {"状态", "status"}:
@@ -969,15 +1064,15 @@ class JMComicReaderPlugin(Star):
     async def jm_rank_choice(self, event: AstrMessageEvent):
         """Handle numeric replies during /jm 榜 selection."""
         text = (event.message_str or "").strip()
-        result = await self._handle_rank_choice(event, text)
-        if result is None:
-            return
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
+        result = await self._handle_rank_choice(event, text)
+        if result is None:
+            return
         if hasattr(event, "stop_event"):
             event.stop_event()
-        yield event.plain_result(result)
+        yield self._event_result(event, result)
 
     @filter.command("jm_help")
     async def jm_help(self, event: AstrMessageEvent):
@@ -1033,12 +1128,12 @@ class JMComicReaderPlugin(Star):
         yield event.plain_result(await self._list_text())
 
     @filter.command("jm_rank")
-    async def jm_rank(self, event: AstrMessageEvent):
+    async def jm_rank(self, event: AstrMessageEvent, page: int = 1):
         """启动 JM 排行榜数字选择流程"""
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
-        yield event.plain_result(self._start_rank_flow(event))
+        yield event.plain_result(self._start_rank_flow(event, page))
 
     @filter.command("jm_random")
     async def jm_random(self, event: AstrMessageEvent, limit: int = 5):
@@ -1046,7 +1141,7 @@ class JMComicReaderPlugin(Star):
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
-        yield event.plain_result(await self._random_text(limit))
+        yield self._event_result(event, await self._random_result(limit))
 
     @filter.command("jm_read")
     async def jm_read(self, event: AstrMessageEvent, jm_id: int = 0):
