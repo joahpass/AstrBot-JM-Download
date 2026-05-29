@@ -7,6 +7,7 @@ import concurrent.futures
 import io
 import json
 import os
+import random
 import re
 import shutil
 import time
@@ -512,6 +513,96 @@ class JMCrawler:
 
             traceback.print_exc()
             return []
+
+    def _page_items(self, page_result) -> List:
+        if not page_result:
+            return []
+        if hasattr(page_result, "album_info_list"):
+            return list(getattr(page_result, "album_info_list", []) or [])
+        if hasattr(page_result, "content"):
+            return list(getattr(page_result, "content", []) or [])
+        if hasattr(page_result, "__iter__") and not isinstance(page_result, (str, bytes)):
+            return list(page_result)
+        return [page_result]
+
+    def _normalize_ranking_category(self, category: str) -> str:
+        category = str(category or "0").strip()
+        allowed = {
+            "0",
+            "doujin",
+            "single",
+            "short",
+            "another",
+            "hanman",
+            "meiman",
+            "doujin_cosplay",
+            "3D",
+            "english_site",
+        }
+        return category if category in allowed else "0"
+
+    def get_ranking(self, time_period: str = "week", category: str = "0", page: int = 1) -> List[Dict]:
+        """Fetch JM ranking items by period and category."""
+        try:
+            page = max(1, int(page or 1))
+            category = self._normalize_ranking_category(category)
+            period = str(time_period or "week").strip().lower()
+            client = self._build_client()
+
+            rank_methods = {
+                "day": getattr(client, "day_ranking", None),
+                "today": getattr(client, "day_ranking", None),
+                "week": getattr(client, "week_ranking", None),
+                "month": getattr(client, "month_ranking", None),
+            }
+            rank_method = rank_methods.get(period) or rank_methods["week"]
+            if not rank_method:
+                return []
+
+            ranking_result = rank_method(page, category)
+            comics = []
+            for item in self._page_items(ranking_result):
+                comic_info = self._extract_search_result(item)
+                if comic_info:
+                    comics.append(comic_info)
+            return comics
+        except Exception as e:
+            print(f"鑾峰彇鎺掕姒滃け璐? {e}")
+            return []
+
+    def get_random_recommendations(self, limit: int = 5) -> List[Dict]:
+        """Pick random recommendations from currently reachable ranking pages."""
+        limit = max(1, min(20, int(limit or 5)))
+        categories = [
+            "0",
+            "doujin",
+            "single",
+            "short",
+            "another",
+            "hanman",
+            "meiman",
+            "doujin_cosplay",
+            "3D",
+            "english_site",
+        ]
+        attempts = [
+            (random.choice(("week", "month")), random.choice(categories), random.randint(1, 3))
+            for _ in range(4)
+        ]
+        attempts.extend([("month", "0", 1), ("week", "0", 1)])
+
+        seen = set()
+        candidates = []
+        for period, category, page in attempts:
+            for comic in self.get_ranking(period, category, page):
+                comic_id = str(comic.get("id") or "")
+                if not comic_id or comic_id in seen:
+                    continue
+                seen.add(comic_id)
+                candidates.append(comic)
+
+        random.shuffle(candidates)
+        return candidates[:limit]
 
     def download_comic(self, album_id: int, progress_callback=None) -> bool:
         """下载漫画。"""

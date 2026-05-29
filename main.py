@@ -65,12 +65,32 @@ def _looks_like_jm_id(value: str) -> bool:
 class JMComicReaderPlugin(Star):
     """Self-contained AstrBot plugin for JMComicReaderProject core features."""
 
+    RANK_CATEGORIES = [
+        ("0", "全部"),
+        ("doujin", "同人"),
+        ("single", "单本"),
+        ("short", "短篇"),
+        ("another", "其他"),
+        ("hanman", "韩漫"),
+        ("meiman", "美漫"),
+        ("doujin_cosplay", "Cosplay"),
+        ("3D", "3D"),
+        ("english_site", "英文"),
+    ]
+    RANK_PERIODS = [
+        ("day", "日排行"),
+        ("week", "周排行"),
+        ("month", "月排行"),
+    ]
+    RANK_SESSION_TTL = 180
+
     def __init__(self, context: Context, config: dict[str, Any] | None = None):
         super().__init__(context)
         self._raw_config = config or {}
         self._config = self._load_config()
         self._download_progress: dict[str, dict[str, Any]] = {}
         self._download_alias: dict[str, str] = {}
+        self._rank_sessions: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._services_ready = False
         self._service_error = ""
@@ -244,6 +264,8 @@ class JMComicReaderPlugin(Star):
                 "/jm 进 <JM号或download_id> - 查进度",
                 "/jm 看 <JM号> - 本地阅读信息",
                 "/jm 列 - 已下载列表",
+                "/jm 榜 - 漫画排行榜，按数字选择分类和时间段",
+                "/jm 随机 - 随机推荐漫画",
                 "/jm 状态 - 插件状态",
                 "/jm 帮助 - 显示帮助",
             ]
@@ -734,6 +756,124 @@ class JMComicReaderPlugin(Star):
             self._download_alias.pop(str(jm_id), None)
         return f"已删除本地漫画: JM-{jm_id}"
 
+    def _rank_session_key(self, event: AstrMessageEvent) -> str:
+        session = str(getattr(event, "unified_msg_origin", "") or "")
+        sender = str(event.get_sender_id() or "")
+        return f"{session}:{sender}"
+
+    def _rank_category_menu(self) -> str:
+        lines = ["JM 漫画排行榜", "请选择排行分类，直接回复数字："]
+        for index, (_, label) in enumerate(self.RANK_CATEGORIES, start=1):
+            lines.append(f"{index}. {label}")
+        lines.append("180 秒内有效。")
+        return "\n".join(lines)
+
+    def _rank_period_menu(self, category_label: str) -> str:
+        lines = [f"已选择分类：{category_label}", "请选择排行时间段，直接回复数字："]
+        for index, (_, label) in enumerate(self.RANK_PERIODS, start=1):
+            lines.append(f"{index}. {label}")
+        lines.append("发送 /jm 榜 可重新选择分类。")
+        return "\n".join(lines)
+
+    def _start_rank_flow(self, event: AstrMessageEvent) -> str:
+        with self._lock:
+            self._rank_sessions[self._rank_session_key(event)] = {
+                "step": "category",
+                "created_at": time.time(),
+            }
+        return self._rank_category_menu()
+
+    def _clear_expired_rank_sessions(self) -> None:
+        now = time.time()
+        with self._lock:
+            expired = [
+                key
+                for key, value in self._rank_sessions.items()
+                if now - float(value.get("created_at", 0)) > self.RANK_SESSION_TTL
+            ]
+            for key in expired:
+                self._rank_sessions.pop(key, None)
+
+    async def _ranking_text(self, period: str, category: str, category_label: str, period_label: str) -> str:
+        if err := self._ensure_ready():
+            return err
+        try:
+            results = await asyncio.to_thread(self.jm_crawler.get_ranking, period, category, 1)
+        except Exception as e:
+            logger.exception("JM ranking failed")
+            return f"获取排行榜失败: {e}"
+
+        if not results and period == "day":
+            results = await asyncio.to_thread(self.jm_crawler.get_ranking, "week", category, 1)
+            period_label = f"{period_label}(暂无结果，已切换周排行)"
+
+        if not results:
+            return "排行榜暂无结果，请稍后再试或换一个分类。"
+
+        limit = self._config["max_search_results"]
+        lines = [f"JM {period_label} / {category_label} (显示前 {min(limit, len(results))} 条)"]
+        for index, comic in enumerate(results[:limit], start=1):
+            lines.append(self._format_comic_line(comic, index))
+        lines.append("详情: /jm <JM号>")
+        lines.append("下载: /jm 下 <JM号>")
+        return "\n".join(lines)
+
+    async def _handle_rank_choice(self, event: AstrMessageEvent, choice_text: str) -> str | None:
+        self._clear_expired_rank_sessions()
+        key = self._rank_session_key(event)
+        with self._lock:
+            session = dict(self._rank_sessions.get(key) or {})
+
+        if not session or not choice_text.isdigit():
+            return None
+
+        choice = int(choice_text)
+        if session.get("step") == "category":
+            if choice < 1 or choice > len(self.RANK_CATEGORIES):
+                return self._rank_category_menu()
+            category, label = self.RANK_CATEGORIES[choice - 1]
+            with self._lock:
+                self._rank_sessions[key] = {
+                    "step": "period",
+                    "category": category,
+                    "category_label": label,
+                    "created_at": time.time(),
+                }
+            return self._rank_period_menu(label)
+
+        if session.get("step") == "period":
+            if choice < 1 or choice > len(self.RANK_PERIODS):
+                return self._rank_period_menu(str(session.get("category_label") or "全部"))
+            period, period_label = self.RANK_PERIODS[choice - 1]
+            category = str(session.get("category") or "0")
+            category_label = str(session.get("category_label") or "全部")
+            with self._lock:
+                self._rank_sessions.pop(key, None)
+            return await self._ranking_text(period, category, category_label, period_label)
+
+        with self._lock:
+            self._rank_sessions.pop(key, None)
+        return None
+
+    async def _random_text(self, limit: int = 5) -> str:
+        if err := self._ensure_ready():
+            return err
+        try:
+            results = await asyncio.to_thread(self.jm_crawler.get_random_recommendations, limit)
+        except Exception as e:
+            logger.exception("JM random recommendation failed")
+            return f"获取随机推荐失败: {e}"
+
+        if not results:
+            return "暂时没有获取到随机推荐，请稍后再试。"
+
+        lines = [f"JM 随机推荐 (显示 {len(results)} 条)"]
+        for index, comic in enumerate(results, start=1):
+            lines.append(self._format_comic_line(comic, index))
+        lines.append("详情: /jm <JM号>")
+        lines.append("下载: /jm 下 <JM号>")
+        return "\n".join(lines)
+
     def _jm_args(self, event: AstrMessageEvent) -> str:
         text = (event.message_str or "").strip()
         if text.startswith("/jm"):
@@ -804,6 +944,17 @@ class JMComicReaderPlugin(Star):
             yield event.plain_result(await self._list_text())
             return
 
+        if action in {"榜", "排行", "排行榜", "rank", "ranking"}:
+            yield event.plain_result(self._start_rank_flow(event))
+            return
+
+        if action in {"随机", "随", "推荐", "random", "recommend"}:
+            limit = 5
+            if rest and rest[0].isdigit():
+                limit = max(1, min(20, int(rest[0])))
+            yield event.plain_result(await self._random_text(limit))
+            return
+
         if action in {"状态", "status"}:
             yield event.plain_result(await self._status_text())
             return
@@ -813,6 +964,20 @@ class JMComicReaderPlugin(Star):
             return
 
         yield event.plain_result(f"未知子命令: {action}\n\n{self._help_text()}")
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def jm_rank_choice(self, event: AstrMessageEvent):
+        """Handle numeric replies during /jm 榜 selection."""
+        text = (event.message_str or "").strip()
+        result = await self._handle_rank_choice(event, text)
+        if result is None:
+            return
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        if hasattr(event, "stop_event"):
+            event.stop_event()
+        yield event.plain_result(result)
 
     @filter.command("jm_help")
     async def jm_help(self, event: AstrMessageEvent):
@@ -866,6 +1031,22 @@ class JMComicReaderPlugin(Star):
             yield event.plain_result(err)
             return
         yield event.plain_result(await self._list_text())
+
+    @filter.command("jm_rank")
+    async def jm_rank(self, event: AstrMessageEvent):
+        """启动 JM 排行榜数字选择流程"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(self._start_rank_flow(event))
+
+    @filter.command("jm_random")
+    async def jm_random(self, event: AstrMessageEvent, limit: int = 5):
+        """随机推荐漫画"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._random_text(limit))
 
     @filter.command("jm_read")
     async def jm_read(self, event: AstrMessageEvent, jm_id: int = 0):
