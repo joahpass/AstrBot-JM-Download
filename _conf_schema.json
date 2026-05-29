@@ -43,6 +43,18 @@
     },
     "hint": "留空表示不按群聊限制。若配置了白名单但当前用户和群聊都未命中，则拒绝使用。"
   },
+  "render_text_as_image": {
+    "description": "将详情和下载提示渲染为图片",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，/jm <JM号> 和 /jm 下 <JM号> 的提示会以图片卡片发送，降低长文本刷屏。"
+  },
+  "render_cover_enabled": {
+    "description": "图片卡片附带漫画封面",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，如果成功获取到漫画封面，会把封面拼入图片卡片左侧。"
+  },
   "auto_delete_enabled": {
     "description": "是否启用定时删除已下载漫画文件",
     "type": "bool",

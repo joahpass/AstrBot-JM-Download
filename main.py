@@ -7,6 +7,7 @@ import shutil
 import sys
 import threading
 import time
+import textwrap
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api import message_components as Comp
 from astrbot.api.star import Context, Star
 from astrbot.core.message.message_event_result import MessageChain
+from PIL import Image, ImageDraw, ImageFont
 
 try:
     from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -94,6 +96,8 @@ class JMComicReaderPlugin(Star):
             "download_dir_name": str(raw_conf.get("download_dir_name") or "ComicDownloads").strip() or "ComicDownloads",
             "user_whitelist": _as_str_list(raw_conf.get("user_whitelist")),
             "group_whitelist": _as_str_list(raw_conf.get("group_whitelist")),
+            "render_text_as_image": _as_bool(raw_conf.get("render_text_as_image"), True),
+            "render_cover_enabled": _as_bool(raw_conf.get("render_cover_enabled"), True),
             "auto_delete_enabled": _as_bool(raw_conf.get("auto_delete_enabled"), False),
             "auto_delete_after_hours": max(1, _as_int(raw_conf.get("auto_delete_after_hours"), 24)),
             "auto_delete_interval_minutes": max(1, _as_int(raw_conf.get("auto_delete_interval_minutes"), 30)),
@@ -108,9 +112,10 @@ class JMComicReaderPlugin(Star):
         self.data_dir = base
         self.download_dir = base / self._safe_download_dir_name(self._config["download_dir_name"])
         self.temp_dir = base / "TempCache"
+        self.render_dir = self.temp_dir / "rendered_messages"
         self.backend_dir = base / "backend"
 
-        for path in (self.data_dir, self.download_dir, self.temp_dir, self.backend_dir):
+        for path in (self.data_dir, self.download_dir, self.temp_dir, self.render_dir, self.backend_dir):
             path.mkdir(parents=True, exist_ok=True)
         self._migrate_legacy_downloads()
 
@@ -258,6 +263,118 @@ class JMComicReaderPlugin(Star):
         detail = f" ({' / '.join(suffix)})" if suffix else ""
         return f"{prefix}JM-{jm_id} | {title}{detail}"
 
+    def _font(self, size: int, bold: bool = False) -> ImageFont.ImageFont:
+        candidates = [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "C:/Windows/Fonts/msyhbd.ttc" if bold else "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/simhei.ttf",
+        ]
+        for font_path in candidates:
+            try:
+                if font_path and Path(font_path).exists():
+                    return ImageFont.truetype(font_path, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def _wrap_text(self, text: str, width: int = 30) -> list[str]:
+        wrapped: list[str] = []
+        for line in str(text).splitlines() or [""]:
+            if not line:
+                wrapped.append("")
+                continue
+            current = ""
+            units = 0
+            for ch in line:
+                ch_units = 2 if ord(ch) > 127 else 1
+                if current and units + ch_units > width:
+                    wrapped.append(current)
+                    current = ch
+                    units = ch_units
+                else:
+                    current += ch
+                    units += ch_units
+            wrapped.append(current)
+        return wrapped
+
+    def _render_text_image(self, text: str, cover_path: str | None = None, title: str = "JM Comic") -> Path:
+        scale = 2
+        cover_enabled = self._config["render_cover_enabled"] and cover_path and Path(cover_path).exists()
+        card_w = 920
+        margin = 36
+        cover_w = 250 if cover_enabled else 0
+        gap = 28 if cover_enabled else 0
+        text_w = card_w - margin * 2 - cover_w - gap
+        title_font = self._font(28 * scale, bold=True)
+        body_font = self._font(21 * scale)
+        meta_font = self._font(16 * scale)
+        line_h = 34 * scale
+        lines = self._wrap_text(text, max(18, text_w // 22))
+        content_h = max(cover_w * 4 // 3 if cover_enabled else 0, 80 + len(lines) * line_h)
+        card_h = min(max(260, content_h // scale + margin * 2), 1600)
+
+        img = Image.new("RGB", (card_w * scale, card_h * scale), (245, 241, 232))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle(
+            [16 * scale, 16 * scale, (card_w - 16) * scale, (card_h - 16) * scale],
+            radius=24 * scale,
+            fill=(255, 252, 246),
+            outline=(226, 215, 196),
+            width=2 * scale,
+        )
+
+        x = margin * scale
+        y = margin * scale
+        if cover_enabled:
+            try:
+                with Image.open(cover_path) as cover:
+                    cover = cover.convert("RGB")
+                    cover.thumbnail((cover_w * scale, int((card_h - margin * 2) * scale)))
+                    cover_box = Image.new("RGB", (cover_w * scale, int((card_h - margin * 2) * scale)), (232, 224, 210))
+                    cx = (cover_box.width - cover.width) // 2
+                    cy = (cover_box.height - cover.height) // 2
+                    cover_box.paste(cover, (cx, cy))
+                    img.paste(cover_box, (x, y))
+                x += (cover_w + gap) * scale
+            except Exception:
+                logger.exception("JM render cover failed")
+
+        draw.text((x, y), title, font=title_font, fill=(47, 42, 35))
+        y += 48 * scale
+        for line in lines[:36]:
+            draw.text((x, y), line, font=body_font, fill=(65, 58, 48))
+            y += line_h
+            if y > (card_h - margin - 28) * scale:
+                draw.text((x, y), "...", font=body_font, fill=(65, 58, 48))
+                break
+        draw.text((x, (card_h - margin + 4) * scale), "AstrBot JM Download", font=meta_font, fill=(145, 126, 96))
+
+        img = img.resize((card_w, card_h), Image.Resampling.LANCZOS)
+        output = self.render_dir / f"jm_render_{datetime.now().strftime('%Y%m%d%H%M%S%f')}.jpg"
+        img.save(output, "JPEG", quality=90)
+        return output
+
+    def _result_chain(self, text: str, cover_path: str | None = None, title: str = "JM Comic") -> list[Any]:
+        if not self._config["render_text_as_image"]:
+            return [Comp.Plain(text)]
+        try:
+            image_path = self._render_text_image(text, cover_path, title)
+            return [Comp.Image.fromFileSystem(str(image_path))]
+        except Exception:
+            logger.exception("JM render message image failed")
+            return [Comp.Plain(text)]
+
+    def _cover_path_from_comic(self, comic: dict[str, Any] | None) -> str | None:
+        if not isinstance(comic, dict):
+            return None
+        for key in ("cover_local", "cover_path"):
+            value = comic.get(key)
+            if value and Path(str(value)).exists():
+                return str(value)
+        return None
+
     async def _status_text(self) -> str:
         lines = [
             "JM 插件状态:",
@@ -304,7 +421,7 @@ class JMComicReaderPlugin(Star):
     async def _info_payload(self, jm_id: int) -> dict[str, Any] | None:
         return await asyncio.to_thread(self.jm_crawler.get_comic_info, jm_id)
 
-    async def _info_text(self, jm_id: int) -> str:
+    async def _info_result(self, jm_id: int) -> list[Any] | str:
         if err := self._ensure_ready():
             return err
         if jm_id <= 0:
@@ -330,7 +447,11 @@ class JMComicReaderPlugin(Star):
             lines.append(f"简介: {comic.get('description')}")
         lines.append(f"阅读: /jm 看 {jm_id}")
         lines.append(f"下载: /jm 下 {jm_id}")
-        return "\n".join(lines)
+        return self._result_chain(
+            "\n".join(lines),
+            self._cover_path_from_comic(comic),
+            f"JM-{jm_id} 详情",
+        )
 
     def _update_progress(self, download_id: str, progress: int, status: str, message: str) -> None:
         with self._lock:
@@ -412,7 +533,7 @@ class JMComicReaderPlugin(Star):
         except Exception:
             logger.exception(f"JM-{jm_id} upload to session failed: {session}")
 
-    async def _download_text(self, jm_id: int, event: AstrMessageEvent | None = None) -> str:
+    async def _download_result(self, jm_id: int, event: AstrMessageEvent | None = None) -> list[Any] | str:
         if err := self._ensure_ready():
             return err
         if jm_id <= 0:
@@ -431,7 +552,11 @@ class JMComicReaderPlugin(Star):
         if already:
             if event:
                 await self._send_download_to_session(event.unified_msg_origin, jm_id, title_line)
-            return f"{title_line}\n已经下载，已尝试上传到当前对话。\n阅读: /jm 看 {jm_id}"
+            return self._result_chain(
+                f"{title_line}\n已经下载，已尝试上传到当前对话。\n阅读: /jm 看 {jm_id}",
+                self._cover_path_from_comic(comic),
+                f"JM-{jm_id} 已下载",
+            )
         if not comic:
             return "启动下载失败: 未找到对应漫画"
 
@@ -469,7 +594,11 @@ class JMComicReaderPlugin(Star):
                     f"当前进度: {progress.get('progress', 0)}% | "
                     f"{progress.get('status', '-')} | {progress.get('message', '-')}"
                 )
-        return "\n".join(lines)
+        return self._result_chain(
+            "\n".join(lines),
+            self._cover_path_from_comic(comic),
+            f"JM-{jm_id} 下载任务",
+        )
 
     def _progress_data(self, download_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -613,6 +742,11 @@ class JMComicReaderPlugin(Star):
             return text[2:].strip()
         return text
 
+    def _event_result(self, event: AstrMessageEvent, result: list[Any] | str):
+        if isinstance(result, list):
+            return event.chain_result(result)
+        return event.plain_result(str(result))
+
     @filter.command("jm")
     async def jm(self, event: AstrMessageEvent):
         """日常主命令：/jm"""
@@ -629,7 +763,7 @@ class JMComicReaderPlugin(Star):
         rest = parts[1:]
 
         if _looks_like_jm_id(action):
-            yield event.plain_result(await self._info_text(int(action)))
+            yield self._event_result(event, await self._info_result(int(action)))
             return
 
         if action in {"搜", "搜索", "s", "search"}:
@@ -649,7 +783,7 @@ class JMComicReaderPlugin(Star):
             if not rest or not _looks_like_jm_id(rest[0]):
                 yield event.plain_result("用法: /jm 下 <JM号>")
                 return
-            yield event.plain_result(await self._download_text(int(rest[0]), event))
+            yield self._event_result(event, await self._download_result(int(rest[0]), event))
             return
 
         if action in {"进", "进度", "p", "progress"}:
@@ -707,7 +841,7 @@ class JMComicReaderPlugin(Star):
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
-        yield event.plain_result(await self._info_text(jm_id))
+        yield self._event_result(event, await self._info_result(jm_id))
 
     @filter.command("jm_download")
     async def jm_download(self, event: AstrMessageEvent, jm_id: int = 0):
@@ -715,7 +849,7 @@ class JMComicReaderPlugin(Star):
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
-        yield event.plain_result(await self._download_text(jm_id, event))
+        yield self._event_result(event, await self._download_result(jm_id, event))
 
     @filter.command("jm_progress")
     async def jm_progress(self, event: AstrMessageEvent, download_id: str = ""):

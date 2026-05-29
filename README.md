@@ -40,6 +40,8 @@ data/plugin_data/astrbot_plugin_jmcomic_reader/ComicDownloads/
 - `download_dir_name`：漫画下载文件夹名称或绝对路径，默认 `ComicDownloads`。
 - `user_whitelist`：个人白名单，填写用户 QQ 号。
 - `group_whitelist`：群聊白名单，填写群号。
+- `render_text_as_image`：是否把详情和下载提示渲染为图片卡片，默认开启。
+- `render_cover_enabled`：图片卡片是否附带漫画封面，默认开启。
 - `auto_delete_enabled`：是否启用定时删除已下载漫画文件，默认关闭。
 - `auto_delete_after_hours`：下载目录保留小时数，默认 24。
 - `auto_delete_interval_minutes`：后台检查间隔分钟数，默认 30。
@@ -73,6 +75,29 @@ auto_delete_interval_minutes = 30
 ```
 
 自动删除会按下载目录的修改时间判断是否过期。删除时会同时删除本地漫画目录和数据库记录，不会撤回已经上传到聊天对话里的文件。
+
+## 图片卡片输出
+
+默认情况下，下面两类输出会渲染为图片卡片：
+
+```text
+/jm <JM号>
+/jm 下 <JM号>
+```
+
+如果插件成功获取到漫画封面，会把封面拼在图片左侧；封面获取失败时仍会发送纯文本渲染图。
+
+如需恢复纯文本输出，可在配置中关闭：
+
+```text
+render_text_as_image = false
+```
+
+如需保留图片卡片但不显示封面，可关闭：
+
+```text
+render_cover_enabled = false
+```
 
 ## 日常命令
 
