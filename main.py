@@ -1064,6 +1064,11 @@ class JMComicReaderPlugin(Star):
     async def jm_rank_choice(self, event: AstrMessageEvent):
         """Handle numeric replies during /jm 榜 selection."""
         text = (event.message_str or "").strip()
+        self._clear_expired_rank_sessions()
+        with self._lock:
+            has_rank_session = self._rank_session_key(event) in self._rank_sessions
+        if not has_rank_session:
+            return
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
