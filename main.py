@@ -446,6 +446,36 @@ class JMComicReaderPlugin(Star):
     async def _info_payload(self, jm_id: int) -> dict[str, Any] | None:
         return await asyncio.to_thread(self.jm_crawler.get_comic_info, jm_id)
 
+    def _format_info_text(self, jm_id: int, comic: dict[str, Any]) -> str:
+        tags = comic.get("tags") or []
+        tags_text = ", ".join(str(tag) for tag in tags[:12]) if isinstance(tags, list) else str(tags)
+        lines = [
+            self._format_comic_line(comic),
+            f"收藏: {comic.get('favorites', '-')}",
+            f"标签: {tags_text or '-'}",
+        ]
+        if comic.get("description"):
+            lines.append(f"简介: {comic.get('description')}")
+        lines.append(f"阅读: /jm 看 {jm_id}")
+        lines.append(f"下载: /jm 下 {jm_id}")
+        return "\n".join(lines)
+
+    async def _info_text(self, jm_id: int) -> str:
+        if err := self._ensure_ready():
+            return err
+        if jm_id <= 0:
+            return "用法: /jm <JM号>"
+
+        try:
+            comic = await self._info_payload(jm_id)
+        except Exception as e:
+            logger.exception("JM info failed")
+            return f"获取详情失败: {e}"
+
+        if not comic:
+            return "获取详情失败: 未找到对应漫画"
+        return self._format_info_text(jm_id, comic)
+
     async def _info_result(self, jm_id: int) -> list[Any] | str:
         if err := self._ensure_ready():
             return err
@@ -461,19 +491,8 @@ class JMComicReaderPlugin(Star):
         if not comic:
             return "获取详情失败: 未找到对应漫画"
 
-        tags = comic.get("tags") or []
-        tags_text = ", ".join(str(tag) for tag in tags[:12]) if isinstance(tags, list) else str(tags)
-        lines = [
-            self._format_comic_line(comic),
-            f"收藏: {comic.get('favorites', '-')}",
-            f"标签: {tags_text or '-'}",
-        ]
-        if comic.get("description"):
-            lines.append(f"简介: {comic.get('description')}")
-        lines.append(f"阅读: /jm 看 {jm_id}")
-        lines.append(f"下载: /jm 下 {jm_id}")
         return self._result_chain(
-            "\n".join(lines),
+            self._format_info_text(jm_id, comic),
             self._cover_path_from_comic(comic),
             f"JM-{jm_id} 详情",
         )
@@ -852,14 +871,25 @@ class JMComicReaderPlugin(Star):
                 "results": list(results),
             }
 
-    async def _ranking_result(
+    def _rank_period_label(self, period: str) -> str:
+        period = str(period or "week").strip().lower()
+        labels = {key: label for key, label in self.RANK_PERIODS}
+        labels["today"] = labels["day"]
+        return labels.get(period, labels["week"])
+
+    def _rank_category_label(self, category: str) -> str:
+        category = str(category or "0").strip()
+        labels = {key: label for key, label in self.RANK_CATEGORIES}
+        return labels.get(category, labels["0"])
+
+    async def _ranking_text(
         self,
         period: str,
         category: str,
         category_label: str,
         period_label: str,
         page: int = 1,
-    ) -> list[Any] | str:
+    ) -> str:
         if err := self._ensure_ready():
             return err
         page = max(1, int(page or 1))
@@ -890,7 +920,20 @@ class JMComicReaderPlugin(Star):
         lines.append("详情: /jm <JM号>")
         lines.append("下载: /jm 下 <JM号>")
         lines.append(f"下一页: /jm 榜 {page + 1}")
-        return self._result_chain("\n".join(lines), title="JM 漫画排行榜")
+        return "\n".join(lines)
+
+    async def _ranking_result(
+        self,
+        period: str,
+        category: str,
+        category_label: str,
+        period_label: str,
+        page: int = 1,
+    ) -> list[Any] | str:
+        text = await self._ranking_text(period, category, category_label, period_label, page)
+        if text.startswith("JM "):
+            return self._result_chain(text, title="JM 漫画排行榜")
+        return text
 
     async def _handle_rank_choice(self, event: AstrMessageEvent, choice_text: str) -> list[Any] | str | None:
         self._clear_expired_rank_sessions()
@@ -1166,6 +1209,150 @@ class JMComicReaderPlugin(Star):
         sender = event.get_sender_name()
         logger.info(f"jm_delete requested by {sender} for JM-{jm_id}")
         yield event.plain_result(await self._delete_text(jm_id))
+
+    async def _download_text_for_llm(self, jm_id: int, event: AstrMessageEvent) -> str:
+        result = await self._download_result(jm_id, event)
+        if isinstance(result, str):
+            return result
+
+        with self._lock:
+            download_id = self._download_alias.get(str(jm_id))
+        if not download_id:
+            return f"JM-{jm_id} 下载任务已处理，请使用 jm_query_download_progress 查询状态。"
+
+        progress = self._progress_data(download_id) or {}
+        lines = [
+            f"JM-{jm_id} 下载任务已启动",
+            f"download_id: {download_id}",
+            f"当前进度: {progress.get('progress', 0)}%",
+            f"状态: {progress.get('status', '-')}",
+            f"消息: {progress.get('message', '-')}",
+            f"查进度: /jm 进 {download_id}",
+        ]
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="jm_search_comics")
+    async def jm_search_comics_tool(self, event: AstrMessageEvent, keyword: str, page: int = 1):
+        """搜索 JM 漫画，适合用户用标题、作者、关键词查找漫画时调用。
+
+        Args:
+            keyword(string): 搜索关键词，可以是标题、作者、标签或用户描述中的关键词。
+            page(number): 搜索页码，从 1 开始，默认 1。
+        """
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._search_text(keyword, page))
+
+    @filter.llm_tool(name="jm_get_comic_info")
+    async def jm_get_comic_info_tool(self, event: AstrMessageEvent, jm_id: int):
+        """获取指定 JM 漫画详情，适合用户给出 JM 号后查询标题、作者、标签、页数等信息。
+
+        Args:
+            jm_id(number): JM 漫画 ID，只填写数字。
+        """
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._info_text(int(jm_id or 0)))
+
+    @filter.llm_tool(name="jm_get_ranking")
+    async def jm_get_ranking_tool(
+        self,
+        event: AstrMessageEvent,
+        period: str = "week",
+        category: str = "0",
+        page: int = 1,
+    ):
+        """获取 JM 漫画排行榜，适合用户询问热门、排行、榜单、最近流行内容时调用。
+
+        Args:
+            period(string): 排行时间段，可选 day、week、month，默认 week。
+            category(string): 排行分类，可选 0、doujin、single、short、another、hanman、meiman、doujin_cosplay、3D、english_site，默认 0 表示全部。
+            page(number): 排行榜页码，从 1 开始，默认 1。
+        """
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        period = str(period or "week").strip().lower()
+        if period == "today":
+            period = "day"
+        if period not in {"day", "week", "month"}:
+            period = "week"
+        category = str(category or "0").strip()
+        valid_categories = {key for key, _ in self.RANK_CATEGORIES}
+        if category not in valid_categories:
+            category = "0"
+        yield event.plain_result(
+            await self._ranking_text(
+                period,
+                category,
+                self._rank_category_label(category),
+                self._rank_period_label(period),
+                page,
+            )
+        )
+
+    @filter.llm_tool(name="jm_random_recommendations")
+    async def jm_random_recommendations_tool(self, event: AstrMessageEvent, limit: int = 5):
+        """随机推荐 JM 漫画，适合用户说“随便推荐”“来点热门”“不知道看什么”时调用。
+
+        Args:
+            limit(number): 推荐数量，默认 5，最大 20。
+        """
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        limit = max(1, min(20, int(limit or 5)))
+        if err := self._ensure_ready():
+            yield event.plain_result(err)
+            return
+        try:
+            results = await asyncio.to_thread(self.jm_crawler.get_random_recommendations, limit)
+        except Exception as e:
+            logger.exception("JM random recommendation tool failed")
+            yield event.plain_result(f"获取随机推荐失败: {e}")
+            return
+        if not results:
+            yield event.plain_result("暂时没有获取到随机推荐，请稍后再试。")
+            return
+        lines = [f"JM 随机推荐 (显示 {len(results)} 条)"]
+        for index, comic in enumerate(results, start=1):
+            lines.append(self._format_comic_line(comic, index))
+        lines.append("详情可调用 jm_get_comic_info，下载可调用 jm_start_download。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.llm_tool(name="jm_start_download")
+    async def jm_start_download_tool(self, event: AstrMessageEvent, jm_id: int):
+        """启动 JM 漫画下载。仅当用户明确要求下载、保存、缓存某个 JM 号时调用。
+
+        Args:
+            jm_id(number): 要下载的 JM 漫画 ID，只填写数字。
+        """
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._download_text_for_llm(int(jm_id or 0), event))
+
+    @filter.llm_tool(name="jm_query_download_progress")
+    async def jm_query_download_progress_tool(self, event: AstrMessageEvent, identifier: str):
+        """查询 JM 下载进度，适合用户询问下载到哪了、是否完成、download_id 状态时调用。
+
+        Args:
+            identifier(string): download_id 或 JM 漫画 ID。
+        """
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._progress_text(str(identifier or "").strip()))
+
+    @filter.llm_tool(name="jm_list_downloaded")
+    async def jm_list_downloaded_tool(self, event: AstrMessageEvent):
+        """列出本地已下载的 JM 漫画，适合用户询问已经下载了哪些漫画时调用。"""
+        if err := self._whitelist_error(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._list_text())
 
     async def terminate(self):
         self._stop_cleanup.set()

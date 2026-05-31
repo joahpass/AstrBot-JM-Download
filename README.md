@@ -213,6 +213,30 @@ download_id: <JM号_时间戳>
 /jm_delete <JM号>
 ```
 
+## LLM 工具调用
+
+插件会向 AstrBot 注册以下 LLM tools，模型可以在对话中按需调用：
+
+```text
+jm_search_comics(keyword, page=1)
+jm_get_comic_info(jm_id)
+jm_get_ranking(period="week", category="0", page=1)
+jm_random_recommendations(limit=5)
+jm_start_download(jm_id)
+jm_query_download_progress(identifier)
+jm_list_downloaded()
+```
+
+说明：
+
+- `jm_search_comics` 用于按关键词搜索漫画。
+- `jm_get_comic_info` 用于按 JM 号查询详情。
+- `jm_get_ranking` 用于获取日榜、周榜、月榜；`category` 支持 `0`、`doujin`、`single`、`short`、`another`、`hanman`、`meiman`、`doujin_cosplay`、`3D`、`english_site`。
+- `jm_random_recommendations` 用于随机推荐。
+- `jm_start_download` 只应在用户明确要求下载时调用，并继续遵守 `allow_download` 和白名单配置。
+- `jm_query_download_progress` 可用 download_id 或 JM 号查询进度。
+- `jm_list_downloaded` 用于列出本地已下载漫画。
+
 ## 注意
 
 - 本插件不内置漫画资源。
