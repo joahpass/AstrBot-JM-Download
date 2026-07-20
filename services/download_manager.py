@@ -6,6 +6,7 @@
 import asyncio
 import io
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -224,26 +225,34 @@ class DownloadManager:
             print(f"异步下载图片失败 {url}: {e}")
 
     async def _create_pdf_from_images(self, comic_dir: str, pdf_path: str):
-        """从根目录图片创建 PDF。章节目录仍以图片阅读为主。"""
+        """Create a PDF from root and chapter images without buffering it in RAM."""
         try:
             image_files = []
-            for filename in sorted(os.listdir(comic_dir)):
-                if filename.lower().endswith((".jpg", ".jpeg", ".png")):
-                    if filename != "cover.jpg":
-                        image_files.append(os.path.join(comic_dir, filename))
+            image_extensions = (".jpg", ".jpeg", ".png", ".webp")
+            for root, dirs, files in os.walk(comic_dir):
+                dirs.sort(key=self._natural_sort_key)
+                for filename in sorted(files, key=self._natural_sort_key):
+                    if filename.lower().endswith(image_extensions) and filename.lower() != "cover.jpg":
+                        image_files.append(os.path.join(root, filename))
 
             if not image_files:
-                return
+                raise RuntimeError("没有找到可生成 PDF 的漫画图片")
 
             try:
-                pdf_data = img2pdf.convert(image_files)
-                if pdf_data:
-                    with open(pdf_path, "wb") as f:
-                        f.write(pdf_data)
+                with open(pdf_path, "wb") as output:
+                    img2pdf.convert(image_files, outputstream=output)
+                if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
+                    raise RuntimeError("PDF 文件为空")
             except Exception as pdf_error:
-                print(f"img2pdf 转换失败: {pdf_error}")
+                if os.path.exists(pdf_path):
+                    os.remove(pdf_path)
+                raise RuntimeError(f"img2pdf 转换失败: {pdf_error}") from pdf_error
         except Exception as e:
-            print(f"创建 PDF 失败: {e}")
+            raise RuntimeError(f"创建 PDF 失败: {e}") from e
+
+    @staticmethod
+    def _natural_sort_key(value: str):
+        return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", value)]
 
     async def _save_comic_info(self, comic_dir: str, comic_info: dict):
         """保存漫画元信息。"""

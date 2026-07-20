@@ -83,6 +83,7 @@ class JMComicReaderPlugin(Star):
         ("month", "月排行"),
     ]
     RANK_SESSION_TTL = 180
+    BROWSE_SESSION_TTL = 600
     RANK_CACHE_TTL = 600
     DOWNLOAD_STALE_SECONDS = 600
 
@@ -93,8 +94,14 @@ class JMComicReaderPlugin(Star):
         self._download_progress: dict[str, dict[str, Any]] = {}
         self._download_alias: dict[str, str] = {}
         self._rank_sessions: dict[str, dict[str, Any]] = {}
+        self._browse_sessions: dict[str, dict[str, Any]] = {}
+        self._reader_sessions: dict[str, dict[str, Any]] = {}
+        self._active_downloads: dict[int, str] = {}
         self._rank_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._lock = threading.RLock()
+        self._download_slots = threading.BoundedSemaphore(
+            self._config["max_concurrent_downloads"]
+        )
         self._services_ready = False
         self._service_error = ""
         self._stop_cleanup = threading.Event()
@@ -124,6 +131,8 @@ class JMComicReaderPlugin(Star):
             "auto_delete_enabled": _as_bool(raw_conf.get("auto_delete_enabled"), False),
             "auto_delete_after_hours": max(1, _as_int(raw_conf.get("auto_delete_after_hours"), 24)),
             "auto_delete_interval_minutes": max(1, _as_int(raw_conf.get("auto_delete_interval_minutes"), 30)),
+            "max_concurrent_downloads": max(1, min(2, _as_int(raw_conf.get("max_concurrent_downloads"), 1))),
+            "upload_retry_count": max(0, min(2, _as_int(raw_conf.get("upload_retry_count"), 1))),
         }
 
     def _init_storage(self) -> None:
@@ -262,10 +271,12 @@ class JMComicReaderPlugin(Star):
             [
                 "JM 常用命令:",
                 "/jm 搜 <关键词> [页码] - 搜索",
+                "搜索后回复 /jm 选 <序号> - 查看结果详情",
                 "/jm <JM号> - 查看详情",
                 "/jm 下 <JM号> - 下载",
                 "/jm 进 <JM号或download_id> - 查进度",
-                "/jm 看 <JM号> - 本地阅读信息",
+                "/jm 看 <JM号> [章节] [页码] - 在聊天中阅读",
+                "/jm 下一页 /jm 上一页 /jm 继续 /jm 退出 - 阅读控制",
                 "/jm 列 - 已下载列表",
                 "/jm 榜 [页码] - 漫画排行榜，按数字选择分类和时间段",
                 "/jm 随机 - 随机推荐漫画",
@@ -273,6 +284,19 @@ class JMComicReaderPlugin(Star):
                 "/jm 帮助 - 显示帮助",
             ]
         )
+
+    def _session_key(self, event: AstrMessageEvent) -> str:
+        session = str(getattr(event, "unified_msg_origin", "") or "")
+        sender = str(event.get_sender_id() or "")
+        return f"{session}:{sender}"
+
+    def _clear_expired_browse_sessions(self) -> None:
+        cutoff = time.time() - self.BROWSE_SESSION_TTL
+        with self._lock:
+            for store in (self._browse_sessions, self._reader_sessions):
+                expired = [key for key, value in store.items() if float(value.get("updated_at", 0)) < cutoff]
+                for key in expired:
+                    store.pop(key, None)
 
     def _format_comic_line(self, comic: dict[str, Any], index: int | None = None) -> str:
         jm_id = comic.get("id") or comic.get("jm_id") or comic.get("album_id") or "-"
@@ -401,6 +425,8 @@ class JMComicReaderPlugin(Star):
         return None
 
     async def _status_text(self) -> str:
+        with self._lock:
+            active_downloads = len(self._active_downloads)
         lines = [
             "JM 插件状态:",
             f"服务初始化: {'正常' if self._services_ready else '失败'}",
@@ -410,6 +436,8 @@ class JMComicReaderPlugin(Star):
             f"个人白名单: {len(self._config['user_whitelist'])} 个",
             f"群聊白名单: {len(self._config['group_whitelist'])} 个",
             f"自动删除: {self._config['auto_delete_enabled']}",
+            f"活动下载: {active_downloads}",
+            f"下载并发上限: {self._config['max_concurrent_downloads']}",
         ]
         if self._config["auto_delete_enabled"]:
             lines.append(f"保留时长: {self._config['auto_delete_after_hours']} 小时")
@@ -417,7 +445,9 @@ class JMComicReaderPlugin(Star):
             lines.append(f"初始化错误: {self._service_error}")
         return "\n".join(lines)
 
-    async def _search_text(self, keyword: str, page: int = 1) -> str:
+    async def _search_text(
+        self, keyword: str, page: int = 1, event: AstrMessageEvent | None = None
+    ) -> str:
         if err := self._ensure_ready():
             return err
         keyword = (keyword or "").strip()
@@ -435,13 +465,41 @@ class JMComicReaderPlugin(Star):
             return "没有搜索结果"
 
         limit = self._config["max_search_results"]
+        visible_results = [comic for comic in results[:limit] if isinstance(comic, dict)]
+        if event:
+            with self._lock:
+                self._browse_sessions[self._session_key(event)] = {
+                    "results": visible_results,
+                    "keyword": keyword,
+                    "page": page,
+                    "updated_at": time.time(),
+                }
         lines = [f"搜索结果: {keyword} (第 {page} 页，显示前 {min(limit, len(results))} 条)"]
-        for index, comic in enumerate(results[:limit], start=1):
-            if isinstance(comic, dict):
-                lines.append(self._format_comic_line(comic, index))
-        lines.append("详情: /jm <JM号>")
-        lines.append("下载: /jm 下 <JM号>")
+        for index, comic in enumerate(visible_results, start=1):
+            lines.append(self._format_comic_line(comic, index))
+        lines.append("查看详情: /jm 选 <序号>")
+        lines.append(f"翻页: /jm 搜 {keyword} {page + 1}")
         return "\n".join(lines)
+
+    async def _select_search_result(
+        self, event: AstrMessageEvent, selection: str
+    ) -> list[Any] | str:
+        self._clear_expired_browse_sessions()
+        with self._lock:
+            state = self._browse_sessions.get(self._session_key(event))
+        if not state:
+            return "没有可选择的搜索结果，请先使用 /jm 搜 <关键词>。"
+        if not str(selection).isdigit():
+            return "请选择搜索结果中的数字序号，例如：/jm 选 1"
+        index = int(selection) - 1
+        results = state.get("results") or []
+        if index < 0 or index >= len(results):
+            return f"序号超出范围，请输入 1-{len(results)}。"
+        comic = results[index]
+        jm_id = comic.get("id") or comic.get("jm_id") or comic.get("album_id")
+        if not jm_id:
+            return "该搜索结果缺少 JM 号，请换一条结果。"
+        return await self._info_result(int(jm_id))
 
     async def _info_payload(self, jm_id: int) -> dict[str, Any] | None:
         return await asyncio.to_thread(self.jm_crawler.get_comic_info, jm_id)
@@ -518,11 +576,18 @@ class JMComicReaderPlugin(Star):
         title_line: str = "",
     ) -> None:
         try:
-            self.download_manager.download_comic(
-                jm_id,
-                comic_info,
-                lambda p, s, m: self._update_progress(download_id, p, s, m),
-            )
+            with self._download_slots:
+                self._update_progress(download_id, 1, "queued", "已进入下载队列")
+                success = self.download_manager.download_comic(
+                    jm_id,
+                    comic_info,
+                    lambda p, s, m: self._update_progress(download_id, p, s, m),
+                )
+            if not success:
+                current = self._progress_data(download_id) or {}
+                if current.get("status") != "error":
+                    self._update_progress(download_id, 0, "error", "下载未生成可用文件")
+                return
             with self._lock:
                 current = self._download_progress.get(download_id, {})
                 if current.get("status") != "error":
@@ -534,7 +599,11 @@ class JMComicReaderPlugin(Star):
                 )
         except Exception as e:
             logger.exception("JM download worker failed")
-            self._update_progress(download_id, 0, "error", str(e))
+            self._update_progress(download_id, 0, "error", f"{type(e).__name__}: {e}")
+        finally:
+            with self._lock:
+                if self._active_downloads.get(jm_id) == download_id:
+                    self._active_downloads.pop(jm_id, None)
 
     def _find_sendable_comic_file(self, jm_id: int) -> Path | None:
         comic_path = self.comic_manager.get_comic_path(jm_id)
@@ -571,13 +640,29 @@ class JMComicReaderPlugin(Star):
                 session,
                 MessageChain([Comp.Plain(f"{header}\n下载完成，正在上传文件...")]),
             )
-            await self.context.send_message(
-                session,
-                MessageChain([Comp.File(name=send_file.name, file=str(send_file.resolve()))]),
-            )
-            logger.info(f"JM-{jm_id} uploaded to session {session}: {send_file}")
-        except Exception:
+            last_error: Exception | None = None
+            for attempt in range(self._config["upload_retry_count"] + 1):
+                try:
+                    await self.context.send_message(
+                        session,
+                        MessageChain([Comp.File(name=send_file.name, file=str(send_file.resolve()))]),
+                    )
+                    logger.info(f"JM-{jm_id} uploaded to session {session}: {send_file}")
+                    return
+                except Exception as e:
+                    last_error = e
+                    if attempt < self._config["upload_retry_count"]:
+                        await asyncio.sleep(3)
+            raise RuntimeError(f"文件上传重试后仍失败: {last_error}")
+        except Exception as e:
             logger.exception(f"JM-{jm_id} upload to session failed: {session}")
+            try:
+                await self.context.send_message(
+                    session,
+                    MessageChain([Comp.Plain(f"JM-{jm_id} 已下载，但文件上传失败：{type(e).__name__}。可再次发送 /jm 下 {jm_id} 重试上传。")]),
+                )
+            except Exception:
+                logger.exception(f"JM-{jm_id} upload failure notification failed")
 
     async def _download_result(self, jm_id: int, event: AstrMessageEvent | None = None) -> list[Any] | str:
         if err := self._ensure_ready():
@@ -606,11 +691,23 @@ class JMComicReaderPlugin(Star):
         if not comic:
             return "启动下载失败: 未找到对应漫画"
 
+        with self._lock:
+            active_id = self._active_downloads.get(jm_id)
+        if active_id:
+            progress = self._progress_data(active_id) or {}
+            return (
+                f"JM-{jm_id} 已有下载任务在运行，无需重复提交。\n"
+                f"download_id: {active_id}\n"
+                f"当前状态: {progress.get('status', 'queued')} | {progress.get('progress', 0)}%\n"
+                f"查进度: /jm 进 {active_id}"
+            )
+
         download_id = f"{jm_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         loop = asyncio.get_running_loop()
         session = event.unified_msg_origin if event else None
         with self._lock:
             self._download_alias[str(jm_id)] = download_id
+            self._active_downloads[jm_id] = download_id
             self._download_progress[download_id] = {
                 "progress": 0,
                 "status": "starting",
@@ -632,15 +729,7 @@ class JMComicReaderPlugin(Star):
             f"download_id: {download_id}",
             f"查进度: /jm 进 {download_id}",
         ]
-        poll_seconds = self._config["download_poll_seconds"]
-        if poll_seconds > 0:
-            await asyncio.sleep(min(poll_seconds, 30))
-            progress = self._progress_data(download_id)
-            if progress:
-                lines.append(
-                    f"当前进度: {progress.get('progress', 0)}% | "
-                    f"{progress.get('status', '-')} | {progress.get('message', '-')}"
-                )
+        lines.append("任务会在完成后自动上传；无需停留等待，可随时查询进度。")
         return self._result_chain(
             "\n".join(lines),
             self._cover_path_from_comic(comic),
@@ -768,30 +857,92 @@ class JMComicReaderPlugin(Star):
         lines.append("阅读: /jm 看 <JM号>")
         return "\n".join(lines)
 
-    async def _read_text(self, jm_id: int) -> str:
+    async def _read_result(
+        self,
+        event: AstrMessageEvent,
+        jm_id: int | None = None,
+        chapter_number: int | None = None,
+        page_number: int | None = None,
+        move: int = 0,
+    ) -> list[Any] | str:
         if err := self._ensure_ready():
             return err
+
+        self._clear_expired_browse_sessions()
+        key = self._session_key(event)
+        with self._lock:
+            previous = dict(self._reader_sessions.get(key) or {})
+        if jm_id is None:
+            jm_id = _as_int(previous.get("jm_id"), 0)
         if jm_id <= 0:
-            return "用法: /jm 看 <JM号>"
+            return "还没有阅读记录。请使用 /jm 看 <JM号> [章节] [页码] 开始阅读。"
 
         try:
             downloaded = await asyncio.to_thread(self.comic_manager.is_comic_downloaded, jm_id)
             if not downloaded:
                 return "该漫画尚未下载。请先使用 /jm 下 <JM号>。"
             chapters = await asyncio.to_thread(self.comic_manager.get_comic_chapters, jm_id)
-            comic_path = await asyncio.to_thread(self.comic_manager.get_comic_path, jm_id)
         except Exception as e:
             logger.exception("JM read failed")
             return f"获取阅读信息失败: {e}"
 
-        return "\n".join(
-            [
-                f"JM-{jm_id}",
-                f"章节数: {len(chapters or [])}",
-                f"本地路径: {comic_path or '-'}",
-                "如需网页阅读，请继续使用 JMComicReaderProject Web 版；本插件不启动 Flask 服务。",
-            ]
+        if not chapters:
+            return "本地漫画存在，但没有找到可阅读的图片页面。"
+
+        same_comic = _as_int(previous.get("jm_id"), 0) == jm_id
+        chapter_number = chapter_number or (_as_int(previous.get("chapter_number"), 1) if same_comic else 1)
+        chapter_number = max(1, min(len(chapters), chapter_number))
+        chapter = chapters[chapter_number - 1]
+        total_pages = max(1, _as_int(chapter.get("pages"), 1))
+        if page_number is None:
+            page_number = _as_int(previous.get("page_number"), 1) if same_comic else 1
+        page_number = page_number + move
+
+        if page_number > total_pages and chapter_number < len(chapters):
+            chapter_number += 1
+            chapter = chapters[chapter_number - 1]
+            total_pages = max(1, _as_int(chapter.get("pages"), 1))
+            page_number = 1
+        elif page_number < 1 and chapter_number > 1:
+            chapter_number -= 1
+            chapter = chapters[chapter_number - 1]
+            total_pages = max(1, _as_int(chapter.get("pages"), 1))
+            page_number = total_pages
+        else:
+            page_number = max(1, min(total_pages, page_number))
+
+        page_path = await asyncio.to_thread(
+            self.comic_manager.get_comic_page_path,
+            jm_id,
+            page_number,
+            str(chapter.get("id") or ""),
         )
+        if not page_path or not Path(page_path).is_file():
+            return f"没有找到第 {chapter_number} 章第 {page_number} 页的图片。"
+
+        with self._lock:
+            self._reader_sessions[key] = {
+                "jm_id": jm_id,
+                "chapter_number": chapter_number,
+                "page_number": page_number,
+                "updated_at": time.time(),
+            }
+        try:
+            await asyncio.to_thread(self.comic_manager.update_read_progress, jm_id, page_number)
+        except Exception:
+            logger.debug("JM read progress persistence failed", exc_info=True)
+
+        caption = (
+            f"JM-{jm_id} | 第 {chapter_number}/{len(chapters)} 章 | "
+            f"第 {page_number}/{total_pages} 页\n"
+            "翻页: /jm 下一页  /jm 上一页  退出: /jm 退出"
+        )
+        return [Comp.Image.fromFileSystem(str(Path(page_path).resolve())), Comp.Plain(caption)]
+
+    def _exit_reader(self, event: AstrMessageEvent) -> str:
+        with self._lock:
+            existed = self._reader_sessions.pop(self._session_key(event), None)
+        return "已退出当前阅读。" if existed else "当前没有进行中的阅读。"
 
     async def _delete_text(self, jm_id: int) -> str:
         if err := self._ensure_ready():
@@ -1051,7 +1202,14 @@ class JMComicReaderPlugin(Star):
                 keyword = " ".join(rest[:-1])
             else:
                 keyword = " ".join(rest)
-            yield event.plain_result(await self._search_text(keyword, page))
+            yield event.plain_result(await self._search_text(keyword, page, event))
+            return
+
+        if action in {"选", "选择", "select"}:
+            if not rest:
+                yield event.plain_result("用法: /jm 选 <搜索结果序号>")
+                return
+            yield self._event_result(event, await self._select_search_result(event, rest[0]))
             return
 
         if action in {"下", "下载", "d", "download"}:
@@ -1070,9 +1228,29 @@ class JMComicReaderPlugin(Star):
 
         if action in {"看", "阅读", "r", "read"}:
             if not rest or not _looks_like_jm_id(rest[0]):
-                yield event.plain_result("用法: /jm 看 <JM号>")
+                yield event.plain_result("用法: /jm 看 <JM号> [章节序号] [页码]")
                 return
-            yield event.plain_result(await self._read_text(int(rest[0])))
+            chapter = int(rest[1]) if len(rest) > 1 and rest[1].isdigit() else 1
+            page = int(rest[2]) if len(rest) > 2 and rest[2].isdigit() else 1
+            yield self._event_result(
+                event, await self._read_result(event, int(rest[0]), chapter, page)
+            )
+            return
+
+        if action in {"下一页", "下页", "next"}:
+            yield self._event_result(event, await self._read_result(event, move=1))
+            return
+
+        if action in {"上一页", "上页", "prev", "previous"}:
+            yield self._event_result(event, await self._read_result(event, move=-1))
+            return
+
+        if action in {"继续", "续", "resume"}:
+            yield self._event_result(event, await self._read_result(event))
+            return
+
+        if action in {"退出", "停止阅读", "close"}:
+            yield event.plain_result(self._exit_reader(event))
             return
 
         if action in {"列", "列表", "l", "list"}:
@@ -1141,7 +1319,7 @@ class JMComicReaderPlugin(Star):
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
-        yield event.plain_result(await self._search_text(keyword, page))
+        yield event.plain_result(await self._search_text(keyword, page, event))
 
     @filter.command("jm_info")
     async def jm_info(self, event: AstrMessageEvent, jm_id: int = 0):
@@ -1197,7 +1375,7 @@ class JMComicReaderPlugin(Star):
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
-        yield event.plain_result(await self._read_text(jm_id))
+        yield self._event_result(event, await self._read_result(event, jm_id, 1, 1))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("jm_delete")
@@ -1242,7 +1420,7 @@ class JMComicReaderPlugin(Star):
         if err := self._whitelist_error(event):
             yield event.plain_result(err)
             return
-        yield event.plain_result(await self._search_text(keyword, page))
+        yield event.plain_result(await self._search_text(keyword, page, event))
 
     @filter.llm_tool(name="jm_get_comic_info")
     async def jm_get_comic_info_tool(self, event: AstrMessageEvent, jm_id: int):

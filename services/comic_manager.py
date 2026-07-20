@@ -510,13 +510,8 @@ class ComicManager:
                         print(f"通过遍历找到页面: {page_path}")
                         return page_path
                 
-                # 如果找不到指定页码，返回最接近的页码
-                if all_images:
-                    # 找到最接近的页码
-                    closest_page = min(all_images, key=lambda x: abs(x[0] - page_num))
-                    page_path = os.path.join(comic_dir, closest_page[1])
-                    print(f"使用最接近的页面: {page_path} (请求: {page_num}, 实际: {closest_page[0]})")
-                    return page_path
+                # Do not silently return a neighboring page. The chat reader
+                # uses a missing result to report an accurate boundary/error.
                     
             except Exception as e:
                 print(f"遍历目录失败: {e}")

@@ -73,5 +73,17 @@
     "type": "int",
     "default": 30,
     "hint": "后台清理线程的检查频率，最小为 1。"
+  },
+  "max_concurrent_downloads": {
+    "description": "最大同时下载任务数",
+    "type": "int",
+    "default": 1,
+    "hint": "2核4G服务器建议保持为 1；最大限制为 2。重复漫画任务会自动合并。"
+  },
+  "upload_retry_count": {
+    "description": "下载完成后的文件上传重试次数",
+    "type": "int",
+    "default": 1,
+    "hint": "QQ 文件上传临时失败时自动重试，允许 0-2 次。"
   }
 }
